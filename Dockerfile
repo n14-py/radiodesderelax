@@ -1,18 +1,33 @@
-# Usamos Alpine Linux (muy ligero y rápido)
-FROM alpine:latest
+# Usamos una imagen de Node.js 18 que tenga Alpine (base de Linux ligera)
+FROM node:18-alpine
 
-# Instalamos FFmpeg, Bash (para el script) y certificados SSL (para leer HTTPS)
-RUN apk add --no-cache ffmpeg bash ca-certificates
+# 1. Instalar dependencias del sistema
+# - ffmpeg: El transmisor ("Músico")
+# - bash: Para ejecutar el script de ffmpeg
+# - tzdata: Para la zona horaria
+RUN apk add --no-cache ffmpeg bash tzdata
 
-# Configuramos la zona horaria (opcional, pero útil para logs)
-RUN apk add --no-cache tzdata
+# 2. Configurar zona horaria
 ENV TZ=America/Asuncion
 
-# Copiamos nuestro script de inicio al contenedor
-COPY start.sh /start.sh
+# 3. Crear directorio de trabajo
+WORKDIR /usr/src/app
 
-# Le damos permisos de ejecución al script
-RUN chmod +x /start.sh
+# 4. Instalar dependencias de Node.js (para el server.js)
+COPY package*.json ./
+RUN npm install --omit=dev
 
-# Comando que se ejecuta al iniciar el servidor
-CMD ["/start.sh"]
+# 5. Copiar el resto del código fuente (server.js)
+COPY . .
+
+# 6. Crear el archivo playlist.txt vacío inicial
+RUN touch playlist.txt && \
+    echo "ffconcat version 1.0" > playlist.txt && \
+    echo "# Esperando primera publicación desde el panel de admin..." >> playlist.txt
+
+# 7. Exponer el puerto que Render usará para la API
+EXPOSE 8080
+ENV PORT=8080
+
+# 8. Comando de inicio: ¡SOLO INICIAMOS NODE.JS!
+CMD ["node", "server.js"]

@@ -1,0 +1,17 @@
+{
+  "name": "radio-transmisor-inteligente",
+  "version": "1.0.0",
+  "description": "Servidor que inicia FFmpeg y escucha órdenes de reinicio",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5",
+    "axios": "^1.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
