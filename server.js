@@ -6,7 +6,7 @@ const fs = require('fs').promises;
 const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8080; // Render usará este puerto
 
 // --- Variables de Entorno (¡Debes configurarlas en Render!) ---
 const {
@@ -26,27 +26,38 @@ let ffmpegProcess = null;
  * Esta función es el "Músico".
  */
 function startFfmpeg() {
+    // Verificamos que las variables de entorno estén cargadas
+    if (!RTMP_URL || !PLAYLIST_URL) {
+        console.error("❌ ERROR FATAL: 'RTMP_URL' o 'PLAYLIST_URL' no están definidas. El stream no puede iniciar.");
+        // No iniciamos FFmpeg si faltan URLs clave
+        return; 
+    }
+    
     console.log("-----------------------------------------");
     console.log(`🚀 Iniciando FFmpeg...`);
     console.log(`Leyendo playlist local: ${LOCAL_PLAYLIST_PATH}`);
     console.log(`Transmitiendo a: ${RTMP_URL}`);
     console.log("-----------------------------------------");
 
-    // Argumentos para FFmpeg
+    // --- ¡AQUÍ ESTÁ LA CORRECCIÓN! ---
+    // El orden de los argumentos es el correcto,
+    // coincidiendo con el comando que te pasaron.
     const args = [
         '-re',
         '-f', 'concat',
         '-safe', '0',
         '-protocol_whitelist', 'file,http,https,tcp,tls',
-        '-i', LOCAL_PLAYLIST_PATH,
-        '-stream_loop', '-1', // Bucle infinito del archivo local
+        '-stream_loop', '-1', // <-- ¡CORREGIDO! Opción de entrada (ANTES de -i)
+        '-i', LOCAL_PLAYLIST_PATH, // <-- Archivo de entrada
+
+        // Opciones de salida (las que te pasaron)
         '-c:a', 'aac',
         '-b:a', '128k',
-        '-ar', '44100',
-        '-ac', '2',
+        '-vn', // <-- Añadido -vn (sin video) como en tu comando original
         '-f', 'flv',
         RTMP_URL
     ];
+    // --- FIN DE LA CORRECCIÓN ---
 
     // Lanzamos FFmpeg
     ffmpegProcess = spawn('ffmpeg', args);
@@ -57,15 +68,18 @@ function startFfmpeg() {
     });
 
     ffmpegProcess.stderr.on('data', (data) => {
-        // Los logs de progreso de FFmpeg salen por stderr
-        console.error(`[FFmpeg STDERR]: ${data}`);
+        // Los logs de progreso de FFmpeg (time=, bitrate=) salen por stderr
+        // Usamos .toString() para que se muestren limpios en los logs de Render
+        console.log(`[FFmpeg]: ${data.toString()}`);
     });
 
-    // Manejo de reinicio: Si FFmpeg muere, lo reiniciamos (excepto si lo matamos nosotros)
+    // Manejo de reinicio: Si FFmpeg muere, lo reiniciamos
     ffmpegProcess.on('close', (code) => {
-        console.warn(`⚠️ FFmpeg se detuvo (código ${code}). Reiniciando en 5 segundos...`);
-        if (code !== 0) { // Si no fue una parada limpia
-            setTimeout(startFfmpeg, 5000); // Reiniciar automáticamente
+        // Solo reinicia si 'ffmpegProcess' no es 'null'
+        // (si es 'null', significa que lo detuvimos manualmente con el botón)
+        if (ffmpegProcess) { 
+             console.warn(`⚠️ FFmpeg se detuvo inesperadamente (código ${code}). Reiniciando en 5 segundos...`);
+             setTimeout(startFfmpeg, 5000); // Reiniciar automáticamente
         }
     });
 
@@ -80,8 +94,11 @@ function startFfmpeg() {
 function stopFfmpeg() {
     if (ffmpegProcess) {
         console.log("🛑 Deteniendo proceso actual de FFmpeg...");
+        // Quitamos el listener 'close' para evitar que se reinicie solo
+        ffmpegProcess.removeAllListeners('close'); 
         ffmpegProcess.kill('SIGINT'); // Envía señal de interrupción
-        ffmpegProcess = null;
+        ffmpegProcess = null; // Marcamos como nulo para que no se reinicie
+        console.log("Proceso FFmpeg detenido manualmente.");
     }
 }
 
@@ -115,14 +132,20 @@ app.post('/actualizar-playlist', async (req, res) => {
         console.log(`Descargando nueva playlist desde ${PLAYLIST_URL}...`);
         const response = await axios.get(PLAYLIST_URL);
         const nuevaPlaylist = response.data;
+        
+        // Verificación rápida de que no esté vacío
+        if (!nuevaPlaylist || !nuevaPlaylist.includes("ffconcat")) {
+            console.error("❌ ERROR: La playlist descargada está vacía o es inválida.");
+            return res.status(500).json({ error: "La playlist descargada del Servidor A es inválida." });
+        }
 
         // 2. Sobrescribir el archivo local
         await fs.writeFile(LOCAL_PLAYLIST_PATH, nuevaPlaylist, 'utf8');
         console.log(`✅ Archivo local 'playlist.txt' actualizado.`);
 
         // 3. Reiniciar FFmpeg
-        stopFfmpeg();
-        setTimeout(startFfmpeg, 1000); // Dar 1 segundo para que libere el archivo
+        stopFfmpeg(); // Detenemos el antiguo
+        setTimeout(startFfmpeg, 1000); // Iniciamos el nuevo
 
         const successMsg = "¡Éxito! Stream reiniciado con la nueva playlist.";
         console.log(successMsg);
@@ -137,7 +160,7 @@ app.post('/actualizar-playlist', async (req, res) => {
 
 // Ruta de "salud" para que Render sepa que está vivo
 app.get('/', (req, res) => {
-    res.send('Servidor Transmisor Híbrido v2.0 - Listo para recibir órdenes.');
+    res.send('Servidor Transmisor Híbrido v2.3 (ffmpeg-corregido) - Listo.');
 });
 
 // --- ¡EL ARRANQUE! ---
