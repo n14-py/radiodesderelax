@@ -1,44 +1,110 @@
 require('dotenv').config();
 const express = require('express');
 const { spawn } = require('child_process');
-const axios = require('axios'); // Para descargar la playlist
-const https = require('https'); // Para descargar los archivos de audio
-const fs = require('fs'); // Para manejar archivos (síncrono)
-const fsp = require('fs').promises; // Para manejar archivos (asíncrono)
+const axios = require('axios');
+const https = require('https');
+const fs = require('fs');
+const fsp = require('fs').promises;
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// --- Variables de Entorno (¡Debes configurarlas en Render!) ---
+// --- Configuración ---
+// PLAYLIST_URL ahora solo sirve para "descubrir" archivos nuevos, no para el orden de reproducción.
 const {
-    PLAYLIST_URL,       // La "URL Mágica" de tu API Central (Servidor A)
-    RTMP_URL,           // La URL de Desdeparaguay
-    INTERNAL_API_KEY    // La clave secreta entre A y B
+    PLAYLIST_URL,       
+    RTMP_URL,           
+    INTERNAL_API_KEY    
 } = process.env;
 
-// --- ¡NUEVAS CONSTANTES DE CACHÉ! ---
-// Esta es la ruta al archivo físico local que FFmpeg estará leyendo
 const LOCAL_PLAYLIST_PATH = path.join(__dirname, 'playlist.txt');
-// Esta es la ruta a tu Disco Persistente en Render (¡debe coincidir!)
 const DISK_CACHE_PATH = '/mnt/disk'; 
 
-// Variable global para guardar el proceso de FFmpeg
 let ffmpegProcess = null;
 
+// ==========================================
+// 1. LÓGICA DEL DJ LOCAL (AUTODIDACTA)
+// ==========================================
+
 /**
- * Inicia el proceso de FFmpeg.
- * (Sin cambios, sigue leyendo el 'playlist.txt' local)
+ * Función "Fisher-Yates Shuffle" para mezclar array aleatoriamente
  */
+function shuffleArray(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+}
+
+/**
+ * Escanea el disco, busca mp3/m4a, los mezcla y genera el playlist.txt
+ */
+async function generarPlaylistLocal() {
+    console.log("💿 [DJ Local] Escaneando biblioteca en disco...");
+    
+    try {
+        // 1. Leer todos los archivos en la carpeta de caché
+        const archivos = await fsp.readdir(DISK_CACHE_PATH);
+        
+        // 2. Filtrar solo archivos de audio válidos
+        // (Asegúrate de que tus archivos tengan extensión, si no, quita el filtro)
+        const canciones = archivos.filter(file => {
+            const ext = path.extname(file).toLowerCase();
+            return ['.mp3', '.m4a', '.aac', '.wav'].includes(ext);
+        });
+
+        if (canciones.length === 0) {
+            console.error("⚠️ [DJ Local] ¡No encontré canciones en el disco! Esperando sincronización...");
+            return false;
+        }
+
+        console.log(`🎵 [DJ Local] Se encontraron ${canciones.length} canciones.`);
+
+        // 3. MEZCLAR LAS CANCIONES (Shuffle)
+        const playlistMezclada = shuffleArray(canciones);
+
+        // 4. Construir el contenido del archivo playlist
+        let contenidoPlaylist = "ffconcat version 1.0\n";
+        
+        playlistMezclada.forEach(cancion => {
+            const rutaAbsoluta = path.join(DISK_CACHE_PATH, cancion);
+            contenidoPlaylist += `file '${rutaAbsoluta}'\n`;
+        });
+
+        // 5. Guardar el archivo
+        await fsp.writeFile(LOCAL_PLAYLIST_PATH, contenidoPlaylist, 'utf8');
+        console.log("✅ [DJ Local] Nueva playlist generada y guardada localmente.");
+        return true;
+
+    } catch (error) {
+        console.error("❌ Error generando playlist local:", error);
+        return false;
+    }
+}
+
+// ==========================================
+// 2. FUNCIONES DE STREAMING (FFMPEG)
+// ==========================================
+
 function startFfmpeg() {
     if (!RTMP_URL) {
-        console.error("❌ ERROR FATAL: 'RTMP_URL' no está definida. El stream no puede iniciar.");
+        console.error("❌ ERROR FATAL: 'RTMP_URL' no definida.");
+        return;
+    }
+
+    // Asegurarnos de que existe el playlist antes de arrancar
+    if (!fs.existsSync(LOCAL_PLAYLIST_PATH)) {
+        console.warn("⚠️ No existe playlist.txt todavía. Intentando generar uno...");
+        generarPlaylistLocal().then(exito => {
+            if (exito) startFfmpeg();
+        });
         return;
     }
     
     console.log("-----------------------------------------");
-    console.log(`🚀 Iniciando FFmpeg...`);
-    console.log(`Leyendo playlist CACHEADA local: ${LOCAL_PLAYLIST_PATH}`);
+    console.log(`🚀 Iniciando FFmpeg (Modo Autodidacta)...`);
     console.log(`Transmitiendo a: ${RTMP_URL}`);
     console.log("-----------------------------------------");
 
@@ -47,8 +113,8 @@ function startFfmpeg() {
         '-f', 'concat',
         '-safe', '0',
         '-protocol_whitelist', 'file,http,https,tcp,tls',
-        '-stream_loop', '-1',
-        '-i', LOCAL_PLAYLIST_PATH, // ¡Lee el archivo local que generamos!
+        '-stream_loop', '-1', // Bucle infinito de la lista actual
+        '-i', LOCAL_PLAYLIST_PATH,
         '-c:a', 'aac',
         '-b:a', '128k',
         '-vn',
@@ -59,12 +125,13 @@ function startFfmpeg() {
     ffmpegProcess = spawn('ffmpeg', args);
 
     ffmpegProcess.stderr.on('data', (data) => {
-        console.log(`[FFmpeg]: ${data.toString()}`);
+        // Descomenta esto si quieres ver logs detallados de ffmpeg
+        // console.log(`[FFmpeg]: ${data.toString()}`);
     });
 
     ffmpegProcess.on('close', (code) => {
         if (ffmpegProcess) { 
-             console.warn(`⚠️ FFmpeg se detuvo inesperadamente (código ${code}). Reiniciando en 5 segundos...`);
+             console.warn(`⚠️ FFmpeg se detuvo (código ${code}). Reiniciando en 5s...`);
              setTimeout(startFfmpeg, 5000);
         }
     });
@@ -74,149 +141,173 @@ function startFfmpeg() {
     });
 }
 
-/**
- * Detiene el proceso de FFmpeg.
- * (Sin cambios)
- */
 function stopFfmpeg() {
     if (ffmpegProcess) {
-        console.log("🛑 Deteniendo proceso actual de FFmpeg...");
+        console.log("🛑 Deteniendo FFmpeg...");
         ffmpegProcess.removeAllListeners('close'); 
         ffmpegProcess.kill('SIGINT');
         ffmpegProcess = null; 
-        console.log("Proceso FFmpeg detenido manualmente.");
     }
 }
 
-/**
- * ¡NUEVA FUNCIÓN HELPER!
- * Descarga un archivo de una URL a un destino en el disco.
- */
+// ==========================================
+// 3. UTILIDADES DE DESCARGA
+// ==========================================
+
 const downloadFile = (url, dest) => new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
-    
     https.get(url, (response) => {
-        // Manejar redirecciones (Cloudinary puede usarlas)
         if (response.statusCode > 300 && response.statusCode < 400 && response.headers.location) {
             https.get(response.headers.location, (res) => {
                 res.pipe(file);
                 file.on('finish', () => file.close(resolve));
             }).on('error', (err) => {
-                fs.unlink(dest, () => reject(err)); // Borrar archivo si falla
+                fs.unlink(dest, () => reject(err));
             });
         } else {
             response.pipe(file);
             file.on('finish', () => file.close(resolve));
         }
     }).on('error', (err) => {
-        fs.unlink(dest, () => reject(err)); // Borrar archivo si falla
+        fs.unlink(dest, () => reject(err));
     });
 });
 
-// --- Middleware de seguridad ---
-// (Sin cambios)
+// ==========================================
+// 4. RUTAS DE LA API
+// ==========================================
+
 app.use(express.json());
 app.use((req, res, next) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey && apiKey === INTERNAL_API_KEY) {
+    if (req.path === '/' || (apiKey && apiKey === INTERNAL_API_KEY)) {
         next();
     } else {
-        console.warn("Intento de acceso RECHAZADO (clave incorrecta)");
         res.status(403).json({ error: "Acceso no autorizado" });
     }
 });
 
 /**
- * ¡LA RUTA DE ACTUALIZACIÓN (REHECHA CON CACHÉ)!
+ * RUTA 1: SINCRONIZAR BIBLIOTECA (Descargar canciones nuevas)
+ * Esta ruta NO reinicia el stream necesariamente, solo baja archivos.
  */
-app.post('/actualizar-playlist', async (req, res) => {
-    console.log("=========================================");
-    console.log("📥 ¡Orden de actualización (con caché) recibida!");
+app.post('/sync-library', async (req, res) => {
+    console.log("📥 [Sync] Iniciando descarga de biblioteca...");
     
-    if (!PLAYLIST_URL) {
-        console.error("❌ ERROR: PLAYLIST_URL no definida.");
-        return res.status(500).json({ error: "Servidor no configurado (falta PLAYLIST_URL)" });
-    }
+    if (!PLAYLIST_URL) return res.status(500).json({ error: "Falta PLAYLIST_URL" });
 
-    let nuevaPlaylistLocal = "ffconcat version 1.0\n"; // El contenido del *nuevo* playlist.txt local
-    let archivosDescargados = 0;
-    let archivosCacheados = 0;
+    let nuevos = 0;
+    let existentes = 0;
 
     try {
-        // 1. Descargar la "Lista Maestra" (de Cloudinary URLs)
-        console.log(`Descargando Lista Maestra desde ${PLAYLIST_URL}...`);
+        // 1. Obtener lista maestra de la API central
         const response = await axios.get(PLAYLIST_URL);
         const playlistMaestra = response.data;
 
-        if (!playlistMaestra || !playlistMaestra.includes("ffconcat")) {
-            throw new Error("La playlist Maestra descargada es inválida.");
-        }
-
-        // 2. Parsear la Lista Maestra para obtener las URLs
         const lineas = playlistMaestra.split('\n');
         const urlsParaProcesar = [];
         for (const linea of lineas) {
             if (linea.startsWith("file 'http")) {
-                const url = linea.substring(6, linea.length - 1);
-                urlsParaProcesar.push(url);
+                urlsParaProcesar.push(linea.substring(6, linea.length - 1));
             }
         }
 
-        console.log(`Procesando ${urlsParaProcesar.length} canciones...`);
+        console.log(`🔎 Analizando ${urlsParaProcesar.length} canciones remotas...`);
 
-        // 3. Bucle de Sincronización (¡La Magia!)
+        // 2. Descargar solo lo que falta
         for (const url of urlsParaProcesar) {
-            // Generar un nombre de archivo local (ej: a partir del final de la URL)
             const nombreArchivo = path.basename(new URL(url).pathname);
             const rutaLocal = path.join(DISK_CACHE_PATH, nombreArchivo);
 
-            // 4. ¿Ya existe en el Disco Persistente?
             if (fs.existsSync(rutaLocal)) {
-                // ¡SÍ! Ahorramos ancho de banda
-                archivosCacheados++;
+                existentes++;
             } else {
-                // ¡NO! Descargamos de Cloudinary
-                console.log(`[CACHE MISS] Descargando ${nombreArchivo} a ${DISK_CACHE_PATH}...`);
+                console.log(`⬇️ Descargando nuevo: ${nombreArchivo}`);
                 await downloadFile(url, rutaLocal);
-                archivosDescargados++;
-                console.log(`-> Descarga completa: ${nombreArchivo}`);
+                nuevos++;
             }
-            
-            // 5. Añadir la *ruta local* (del disco) a nuestro nuevo playlist.txt
-            nuevaPlaylistLocal += `file '${rutaLocal}'\n`;
         }
 
-        // 6. Sobrescribir el 'playlist.txt' que lee FFmpeg
-        await fsp.writeFile(LOCAL_PLAYLIST_PATH, nuevaPlaylistLocal, 'utf8');
-        console.log(`✅ 'playlist.txt' local actualizado (apunta al disco persistente).`);
-        console.log(`Reporte: ${archivosDescargados} descargados, ${archivosCacheados} desde caché.`);
-
-        // 7. Reiniciar FFmpeg
-        stopFfmpeg();
-        setTimeout(startFfmpeg, 1000); // Iniciar el nuevo
-
-        const successMsg = "¡Éxito! Stream reiniciado (Caché Sincronizado).";
-        console.log(successMsg);
-        console.log("=========================================");
-        res.json({ message: successMsg, downloaded: archivosDescargados, cached: archivosCacheados });
+        res.json({ message: "Biblioteca actualizada", nuevos, existentes });
 
     } catch (error) {
-        console.error(`Error en el proceso de actualización (caché): ${error.message}`);
-        res.status(500).json({ error: "No se pudo sincronizar la playlist con caché." });
+        console.error("Error en sync-library:", error);
+        res.status(500).json({ error: error.message });
     }
 });
 
-// Ruta de "salud"
-app.get('/', (req, res) => {
-    res.send('Servidor Transmisor  - Listo.');
+/**
+ * RUTA 2: REGENERAR PLAYLIST (El DJ baraja de nuevo)
+ * Llama a esto si quieres cambiar el orden de las canciones o incluir las recién descargadas.
+ */
+app.post('/mezclar-radio', async (req, res) => {
+    console.log("🔀 [Orden Manual] Solicitud de re-mezcla recibida.");
+    
+    const exito = await generarPlaylistLocal();
+    if (exito) {
+        // Reiniciamos FFmpeg para que tome la nueva lista
+        stopFfmpeg();
+        setTimeout(startFfmpeg, 1000);
+        res.json({ message: "Radio re-mezclada y reiniciada." });
+    } else {
+        res.status(500).json({ error: "No se pudo generar la playlist (¿carpeta vacía?)" });
+    }
 });
 
-// --- ¡EL ARRANQUE! ---
-app.listen(PORT, () => {
-    console.log(`📡 Servidor Transmisor (Recepcionista) escuchando en puerto ${PORT}`);
-    console.log("Deploy marcado como 'Live'.");
-    console.log(`Disco Persistente (Caché) conectado en: ${DISK_CACHE_PATH}`);
+/**
+ * RUTA LEGACY: Mantenemos la ruta anterior por compatibilidad,
+ * pero ahora hace las dos cosas: Sincroniza Y Mezcla.
+ */
+app.post('/actualizar-playlist', async (req, res) => {
+    console.log("🔄 [Legacy] Actualización completa solicitada...");
     
-    // Inicia FFmpeg por primera vez (probablemente con la lista vacía)
-    setTimeout(startFfmpeg, 3000); 
+    // 1. Llamamos internamente a la lógica de sync (podrías refactorizarlo, pero lo simulamos aquí)
+    // Para simplificar, redirigimos la lógica:
+    try {
+        // Paso A: Sync
+        // (Copiado lógica breve para no duplicar código complejo aquí, 
+        //  en producción idealmente extraes la lógica de sync a una función aparte)
+        const response = await axios.get(PLAYLIST_URL);
+        const playlistMaestra = response.data;
+        const lineas = playlistMaestra.split('\n');
+        let descargados = 0;
+        
+        for (const linea of lineas) {
+            if (linea.startsWith("file 'http")) {
+                const url = linea.substring(6, linea.length - 1);
+                const rutaLocal = path.join(DISK_CACHE_PATH, path.basename(new URL(url).pathname));
+                if (!fs.existsSync(rutaLocal)) {
+                    await downloadFile(url, rutaLocal);
+                    descargados++;
+                }
+            }
+        }
+
+        // Paso B: Generar Playlist y Reiniciar
+        await generarPlaylistLocal();
+        stopFfmpeg();
+        setTimeout(startFfmpeg, 1000);
+
+        res.json({ message: "Sistema actualizado y reiniciado.", downloaded: descargados });
+
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/', (req, res) => res.send('📻 Radio Autodidacta - Online'));
+
+// --- ARRANQUE ---
+app.listen(PORT, async () => {
+    console.log(`📡 Servidor Radio Autodidacta en puerto ${PORT}`);
+    console.log(`📂 Carpeta de música: ${DISK_CACHE_PATH}`);
+
+    // Al arrancar, intenta generar playlist de lo que ya tenga y empieza a transmitir
+    // No espera a Internet para empezar a sonar.
+    const tieneMusica = await generarPlaylistLocal();
+    if (tieneMusica) {
+        setTimeout(startFfmpeg, 3000);
+    } else {
+        console.log("⚠️ Esperando primera sincronización para arrancar stream...");
+    }
 });
